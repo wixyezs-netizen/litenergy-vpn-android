@@ -139,7 +139,7 @@ jobs:
           mkdir -p emu
           for f in app/build/outputs/apk/other/release/*.apk; do
             n=$(basename "$f")
-            abi=$(echo "$n" | sed -E 's/.*-(arm64-v8a|armeabi-v7a|x86_64|universal)-release\.apk$/\1/')
+            abi=$(echo "$n" | sed -E 's/.*-(arm64-v8a|armeabi-v7a|x86_64|universal)(-release)?\.apk$/\1/')
             if [ "$abi" = "x86_64" ]; then cp "$f" "emu/LitEnergy-VPN-x86_64.apk"; else cp "$f" "dist/LitEnergy-VPN-${VERSION_NAME_RAW}-${abi}.apk"; fi
           done
           VERSION_CODE=$(grep VERSION_CODE version.properties | cut -d= -f2)
