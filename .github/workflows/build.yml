@@ -1,0 +1,263 @@
+name: Build LitEnergy VPN
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore: ["**.md"]
+
+permissions:
+  contents: write
+
+env:
+  CORE_REF: v1.14.3
+  GO_VERSION: 1.26.8
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  libbox:
+    name: Core library (${{ matrix.go_arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        go_arch: [arm64, arm, amd64]
+    steps:
+      - name: Checkout core
+        uses: actions/checkout@v5
+        with:
+          repository: SagerNet/sing-box
+          ref: ${{ env.CORE_REF }}
+          fetch-depth: 1
+          fetch-tags: true
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-${{ env.CORE_REF }}-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+      - name: Setup JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Build library
+        run: |
+          git tag -f ${{ env.CORE_REF }}
+          make lib_install
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          go run ./cmd/internal/build_libbox -target android -platform android/${{ matrix.go_arch }}
+          mkdir -p dist/${{ matrix.go_arch }}
+          mv libbox.aar dist/${{ matrix.go_arch }}/
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+      - name: Upload library
+        uses: actions/upload-artifact@v4
+        with:
+          name: libbox-${{ matrix.go_arch }}
+          path: dist
+          compression-level: 0
+          retention-days: 3
+
+  app:
+    name: APK
+    runs-on: ubuntu-latest
+    needs: libbox
+    steps:
+      - name: Checkout app
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - name: Checkout core (merge tool)
+        uses: actions/checkout@v5
+        with:
+          repository: SagerNet/sing-box
+          ref: ${{ env.CORE_REF }}
+          path: .core
+          fetch-depth: 1
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+      - name: Setup JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Download libraries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: libbox-*
+          path: libbox-inputs
+          merge-multiple: true
+      - name: Merge libraries
+        run: |
+          cd .core
+          go run ./cmd/internal/merge_aar -output ../libbox.aar $(ls -d ../libbox-inputs/*/libbox.aar)
+          cd ..
+          mkdir -p app/libs
+          cp libbox.aar app/libs/
+          # legacy flavor is not built, but Gradle resolves its file dependency
+          cp libbox.aar app/libs/libbox-legacy.aar
+          ls -la app/libs
+      - name: Signing key
+        run: |
+          if [ -z "${{ secrets.KEYSTORE_B64 }}" ]; then echo "KEYSTORE_B64 secret is missing"; exit 1; fi
+          echo "${{ secrets.KEYSTORE_B64 }}" | base64 -d > app/release.keystore
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Build APK
+        run: ./gradlew --no-daemon :app:assembleOtherRelease
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          LOCAL_PROPERTIES: ${{ secrets.LOCAL_PROPERTIES }}
+      - name: Prepare files
+        run: |
+          rm -f app/release.keystore
+          mkdir -p dist
+          VERSION_NAME_RAW=$(grep VERSION_NAME version.properties | cut -d= -f2)
+          mkdir -p emu
+          for f in app/build/outputs/apk/other/release/*.apk; do
+            n=$(basename "$f")
+            abi=$(echo "$n" | sed -E 's/.*-(arm64-v8a|armeabi-v7a|x86_64|universal)-release\.apk$/\1/')
+            if [ "$abi" = "x86_64" ]; then cp "$f" "emu/LitEnergy-VPN-x86_64.apk"; else cp "$f" "dist/LitEnergy-VPN-${VERSION_NAME_RAW}-${abi}.apk"; fi
+          done
+          VERSION_CODE=$(grep VERSION_CODE version.properties | cut -d= -f2)
+          VERSION_NAME=$(grep VERSION_NAME version.properties | cut -d= -f2)
+          printf '{\n  "version_code": %s,\n  "version_name": "%s"\n}\n' "$VERSION_CODE" "$VERSION_NAME" > dist/SFA-version-metadata.json
+          cd dist && sha256sum *.apk > SHA256SUMS.txt && ls -la
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LitEnergy-VPN-apk
+          path: dist
+          retention-days: 30
+      - name: Upload emulator APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-apk
+          path: emu
+          retention-days: 3
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* --title "LitEnergy VPN ${GITHUB_REF_NAME}" \
+            --notes "LitEnergy VPN для Android ${GITHUB_REF_NAME}. arm64-v8a — большинство современных телефонов, armeabi-v7a — старые телефоны, universal — подходит всем. Основано на sing-box ${CORE_REF} (GPL-3.0)." || \
+          gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+
+  smoke:
+    name: Emulator check
+    runs-on: ubuntu-latest
+    needs: app
+    timeout-minutes: 30
+    steps:
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: emulator-apk
+          path: apk
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: bash -c "$SMOKE"
+        env:
+          SMOKE: |
+            set -x
+            P=com.litenergy.vpn
+            A=$P/io.nekohasekai.sfa.compose.MainActivity
+            mkdir -p shots
+            adb install -r apk/LitEnergy-VPN-x86_64.apk
+            adb logcat -c
+            adb shell cmd locale set-app-locales $P --locales ru-RU || true
+            cat > tap.py <<'PY'
+            import re, subprocess, sys, time
+            def dump():
+                subprocess.run("adb shell uiautomator dump /sdcard/ui.xml", shell=True, capture_output=True)
+                return subprocess.run("adb exec-out cat /sdcard/ui.xml", shell=True, capture_output=True).stdout.decode("utf-8", "ignore")
+            def find(s, text):
+                pat = r'(?:text|content-desc)="' + re.escape(text) + r'"'
+                m = re.search(pat + r'[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', s)
+                return None if not m else ((int(m[1]) + int(m[3])) // 2, (int(m[2]) + int(m[4])) // 2)
+            for _ in range(5):
+                s = dump()
+                w = find(s, "Wait") or find(s, "Подождать")
+                if not w: break
+                subprocess.run(f"adb shell input tap {w[0]} {w[1]}", shell=True); time.sleep(2)
+            xy = find(s, sys.argv[1])
+            if xy: subprocess.run(f"adb shell input tap {xy[0]} {xy[1]}", shell=True)
+            print("tapped" if xy else "not found", sys.argv[1])
+            PY
+            sed -i 's/^            //' tap.py
+            shot() { adb exec-out screencap -p > "shots/$1.png"; }
+            demo() { adb shell am force-stop $P; sleep 1; adb shell am start -n $A --ez demo true "$@"; sleep 8; python3 tap.py "__none__"; }
+            adb shell am start -n $A
+            sleep 20
+            python3 tap.py "__none__"; sleep 1
+            shot 01-onboarding
+            python3 tap.py "Вставить ссылку"; sleep 2
+            shot 02-link
+            demo
+            shot 03-home-off
+            python3 tap.py "Подключить"; sleep 4
+            python3 tap.py "Allow"; sleep 3
+            python3 tap.py "OK"; sleep 12
+            shot 04-home-on
+            adb shell dumpsys connectivity | grep -c "VPN" | sed 's/^/vpn_lines=/' | tee -a shots/status.txt || true
+            adb shell cmd statusbar expand-notifications; sleep 3
+            shot 05-notification
+            adb shell cmd statusbar collapse; sleep 2
+            demo --es demo_sheet servers
+            shot 06-servers
+            demo --es demo_sheet plans
+            shot 07-plans
+            demo --es demo_sheet menu
+            shot 08-menu
+            demo --es demo_sheet settings
+            shot 09-settings
+            demo --es demo_sheet subscriptions
+            shot 10-subscriptions
+            demo --ez demo_expired true
+            shot 11-expired
+            adb shell pidof $P && echo "APP_ALIVE=1" | tee -a shots/status.txt || echo "APP_ALIVE=0" | tee -a shots/status.txt
+            adb logcat -d -b crash > shots/crash.txt || true
+            adb logcat -d | grep -iE "AndroidRuntime|FATAL|LitEnergy|libbox" | tail -300 > shots/logcat.txt || true
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-screens
+          path: shots
+          retention-days: 7
