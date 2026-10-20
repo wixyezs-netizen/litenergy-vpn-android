@@ -228,7 +228,7 @@ object LitStore {
         var link = account.subscriptionUrl
         val boot = withContext(Dispatchers.IO) { runCatching { Api.bootstrap(account.token) }.getOrNull() }
         if (boot != null) {
-            if (boot.tariffs.isNotEmpty()) setTariffs(boot.tariffs)
+            if (boot.tariffs.isNotEmpty()) saveTariffs(boot.tariffs)
             if (link.isNullOrEmpty()) link = boot.subscriptionUrl
         }
         if (link.isNullOrEmpty()) throw LitException("Вход выполнен, но активной подписки нет. Оформите её в боте или на сайте.")
@@ -247,13 +247,13 @@ object LitStore {
         val token = withContext(Dispatchers.IO) { session } ?: return
         withContext(Dispatchers.IO) {
             runCatching { Api.bootstrap(token) }.getOrNull()?.tariffs?.takeIf { it.isNotEmpty() }?.let {
-                withContext(Dispatchers.Main) { setTariffs(it) }
+                withContext(Dispatchers.Main) { saveTariffs(it) }
             }
             runCatching { Api.refreshSession(token) }.getOrNull()?.let { SecureStore.set(app, "session", it) }
         }
     }
 
-    private fun setTariffs(list: List<Tariff>) {
+    private fun saveTariffs(list: List<Tariff>) {
         tariffs = list
         prefs.edit().putString("tariffs", json.encodeToString(list)).apply()
     }
